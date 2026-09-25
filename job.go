@@ -2,11 +2,9 @@ package dago
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/philippgille/gokv"
 )
@@ -27,13 +25,6 @@ const (
 type writeOp struct {
 	key string
 	val state
-}
-
-// execution represents a single run of a job.
-type execution struct {
-	ID                string
-	State             state
-	ModifiedTimestamp string
 }
 
 // Job is a workflow consisting of independent and dependent tasks.
@@ -136,6 +127,24 @@ func (j *Job) storeTaskState(task string, value state) {
 	j.Unlock()
 }
 
+// Execute creates a new execution, persists it, and runs the job workflow.
+func (j *Job) Execute(ctx context.Context, store gokv.Store) (*execution, error) {
+	if j.Dag == nil {
+		j.initialize()
+	}
+
+	e := j.newExecution()
+
+	if err := persistNewExecution(store, e); err != nil {
+		return e, fmt.Errorf("persistNewExecution: %w", err)
+	}
+	if err := indexExecutions(store, e); err != nil {
+		return e, fmt.Errorf("indexExecutions: %w", err)
+	}
+
+	return e, j.run(ctx, store, e)
+}
+
 // run executes the job workflow using a gokv.Store for persistence.
 func (j *Job) run(ctx context.Context, store gokv.Store, e *execution) error {
 	if !j.Dag.validate() {
@@ -172,16 +181,17 @@ func (j *Job) run(ctx context.Context, store gokv.Store, e *execution) error {
 
 			// 3. Handle Retries asynchronously to avoid blocking the main event loop
 			if write.val == upForRetry {
-				go j.handleRetry(ctx, e.ID, write.key, writes)
+				go j.handleRetry(ctx, e.ID.String(), write.key, writes) // Fixed: .String() added
 			} else {
 				// For success, failure, or skip, evaluate if downstream tasks can now start
-				j.evaluateDownstreamTasks(ctx, e.ID, writes)
+				j.evaluateDownstreamTasks(ctx, e.ID.String(), writes) // Fixed: .String() added
 			}
 
 			// 4. Sync to gokv store
 			e.State = j.loadState()
-			e.ModifiedTimestamp = time.Now().UTC().Format(time.RFC3339Nano)
-			syncStateToStore(store, e, write.key, write.val)
+			if err := syncStateToStore(store, e, write.key, write.val); err != nil {
+				log.Printf("jobID=%v, job=%v, msg=persist_failed err=%v", e.ID, j.Name, err)
+			}
 
 			// 5. Check if the entire job is finished
 			if j.allDone() {
@@ -274,19 +284,4 @@ func (j *Job) allDone() bool {
 		}
 	}
 	return true
-}
-
-// syncStateToStore persists the execution and task state to the gokv store.
-func syncStateToStore(store gokv.Store, e *execution, taskName string, taskState state) {
-	if store == nil {
-		return
-	}
-
-	execKey := fmt.Sprintf("execution:%s", e.ID)
-	if execBytes, err := json.Marshal(e); err == nil {
-		_ = store.Set(execKey, execBytes)
-	}
-
-	taskKey := fmt.Sprintf("execution:%s:task:%s", e.ID, taskName)
-	_ = store.Set(taskKey, string(taskState))
 }

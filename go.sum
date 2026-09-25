@@ -1,4 +1,6 @@
 github.com/ef-ds/deque v1.0.4 h1:iFAZNmveMT9WERAkqLJ+oaABF9AcVQ5AjXem/hroniI=
 github.com/ef-ds/deque v1.0.4/go.mod h1:gXDnTC3yqvBcHbq2lcExjtAcVrOnJCbMcZXmuj8Z4tg=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/philippgille/gokv v0.7.0 h1:rQSIQspete82h78Br7k7rKUZ8JYy/hWlwzm/W5qobPI=
 github.com/philippgille/gokv v0.7.0/go.mod h1:OwiTP/3bhEBhSuOmFmq1+rszglfSgjJVxd1HOgOa2N4=
