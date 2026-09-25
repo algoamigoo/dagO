@@ -108,6 +108,16 @@ Capture
 
 A **Task** represents an individual unit of work within a job.
 
+*   **`Name` (string)**: The unique identifier for this task within a Job. The DAG uses this string as the key to map dependencies (e.g., "Task A must finish before Task B").
+*   **`Operator` (Operator)**: The actual logic to be executed. This is an application of the **Strategy Pattern**. The Task doesn't care if the operator runs a shell command, makes an HTTP request, or queries a database. It just calls `Operator.Run()`.
+*   **`TriggerRule` (triggerRule)**: Dictates when this task is allowed to start based on its upstream dependencies.
+    *   **`allSuccessful`**: (Default) The task will only run if *every* upstream task finishes with a `successful` state. If any upstream task fails, this task is `skipped`.
+    *   **`allDone`**: The task will run as soon as *every* upstream task reaches a terminal state (`successful`, `failed`, or `skipped`), regardless of the outcome. This is essential for cleanup, teardown, or alerting tasks that must run even if the pipeline crashes.
+*   **`Retries` (int)**: The configured maximum number of retry attempts allowed (e.g., `3`). This is a static configuration value.
+*   **`RetryDelay` (RetryDelay)**: The strategy interface defining how long to wait between retry attempts (e.g., constant wait vs. exponential backoff).
+*   **`remaining` (int)**: The runtime counter. When the Job initializes, this is set to the value of `Retries`. It decrements with each failure. This separation (`Retries` vs `remaining`) allows the system to know both the original configuration and the current dynamic state.
+*   **`state` (state)**: The current status of the task (e.g., `"notstarted"`, `"running"`, `"successful"`). Crucially, the `run` method does not mutate this field directly. It only reports what the state *should* become.
+
 A task contains:
 
 ```text
@@ -119,7 +129,6 @@ Task
  ├── Trigger Rule
  └── Execution State
 ```
-
 Example:
 
 ```go

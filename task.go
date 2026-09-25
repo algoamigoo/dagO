@@ -25,8 +25,7 @@ const (
 	allSuccessful triggerRule = "allSuccessful"
 )
 
-// run executes the task's operator.
-// Notice the channel is now send-only: chan<- writeOp
+// run executes the task's operator
 func (t *Task) run(ctx context.Context, writes chan<- writeOp) error {
 	_, err := t.Operator.Run(ctx)
 
@@ -47,7 +46,6 @@ func (t *Task) run(ctx context.Context, writes chan<- writeOp) error {
 	return nil
 }
 
-// Notice the channel is now send-only: chan<- writeOp
 func (t *Task) skip(writes chan<- writeOp) error {
 	writes <- writeOp{t.Name, skipped}
 	return nil

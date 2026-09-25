@@ -38,14 +38,14 @@ type execution struct {
 
 // Job is a workflow consisting of independent and dependent tasks.
 type Job struct {
-	Name     string
-	Tasks    map[string]*Task
-	Schedule string
-	Dag      dag
-	Active   bool
-	state    state
-	tasks    []string
-	sync.RWMutex
+	Name         string
+	Tasks        map[string]*Task
+	Schedule     string // Placeholder for cron-like scheduling
+	Dag          dag
+	Active       bool     // Is this job currently running?
+	state        state    // Overall job status
+	tasks        []string // Ordered list of task names
+	sync.RWMutex          // CRITICAL: Protects concurrent access to states
 }
 
 // Initialize a job.
@@ -53,7 +53,7 @@ func (j *Job) initialize() *Job {
 	j.Dag = make(dag)
 	j.Tasks = make(map[string]*Task)
 	j.tasks = make([]string, 0)
-	j.storeState(none)
+	j.state = none
 	return j
 }
 
@@ -68,6 +68,7 @@ func (j *Job) Add(t *Task) *Job {
 	}
 
 	t.remaining = t.Retries
+	t.state = none // Explicitly set initial state
 
 	j.Lock()
 	j.Tasks[t.Name] = t
@@ -75,7 +76,6 @@ func (j *Job) Add(t *Task) *Job {
 	j.Dag.addNode(t.Name)
 	j.Unlock()
 
-	j.storeTaskState(t.Name, none)
 	return j
 }
 
@@ -94,35 +94,38 @@ func (j *Job) SetDownstream(ind, dep *Task) *Job {
 	return j
 }
 
+// loadState evaluates the overall job state in a single, efficient pass.
 func (j *Job) loadState() state {
 	j.RLock()
 	defer j.RUnlock()
 
-	if j.allSuccessful() {
-		return successful
+	done := true
+	hasFailed := false
+	allSucc := true
+
+	for _, t := range j.Tasks {
+		if t.state == none || t.state == running || t.state == upForRetry {
+			done = false
+		}
+		if t.state == failed {
+			hasFailed = true
+		}
+		if t.state != successful {
+			allSucc = false
+		}
 	}
-	if j.allDone() && j.anyFailed() {
-		return failed
-	}
-	if !j.allDone() {
+
+	if !done {
 		return running
 	}
-	return j.state
-}
-
-func (j *Job) loadTaskState(task string) state {
-	j.RLock()
-	defer j.RUnlock()
-	if t, ok := j.Tasks[task]; ok {
-		return t.state
+	if allSucc {
+		return successful
 	}
-	return none
-}
-
-func (j *Job) storeState(value state) {
-	j.Lock()
-	j.state = value
-	j.Unlock()
+	if hasFailed {
+		return failed
+	}
+	// If done, not all successful, but no failures (e.g., all tasks were skipped)
+	return successful
 }
 
 func (j *Job) storeTaskState(task string, value state) {
@@ -141,10 +144,10 @@ func (j *Job) run(ctx context.Context, store gokv.Store, e *execution) error {
 
 	log.Printf("jobID=%v, jobname=%v, msg=starting", e.ID, j.Name)
 
-	// Buffered channel to prevent goroutines from blocking if the loop is busy
+	// Buffered channel prevents goroutines from blocking if the manager is momentarily busy
 	writes := make(chan writeOp, len(j.Tasks))
 
-	// 1. Start the initial independent tasks before entering the loop
+	// 1. Kickstart: Start initial independent tasks before entering the event loop
 	j.Lock()
 	for _, task := range j.Tasks {
 		if !j.Dag.isDownstream(task.Name) && task.state == none {
@@ -167,23 +170,54 @@ func (j *Job) run(ctx context.Context, store gokv.Store, e *execution) error {
 			j.storeTaskState(write.key, write.val)
 			log.Printf("jobID=%v, job=%v, task=%v, msg=%v", e.ID, j.Name, write.key, write.val)
 
-			// Sync to gokv store
+			// 3. Handle Retries asynchronously to avoid blocking the main event loop
+			if write.val == upForRetry {
+				go j.handleRetry(ctx, e.ID, write.key, writes)
+			} else {
+				// For success, failure, or skip, evaluate if downstream tasks can now start
+				j.evaluateDownstreamTasks(ctx, e.ID, writes)
+			}
+
+			// 4. Sync to gokv store
 			e.State = j.loadState()
 			e.ModifiedTimestamp = time.Now().UTC().Format(time.RFC3339Nano)
-
 			syncStateToStore(store, e, write.key, write.val)
 
-			// 3. Evaluate downstream tasks to see if they can start now
-			j.evaluateDownstreamTasks(ctx, e.ID, writes)
-
-			// 4. Check if the entire job is finished
+			// 5. Check if the entire job is finished
 			if j.allDone() {
 				finalState := j.loadState()
 				log.Printf("jobID=%v, job=%v, msg=%v", e.ID, j.Name, finalState)
-				return nil // Returning here removes the "unreachable code" error
+				return nil
 			}
 		}
 	}
+}
+
+// handleRetry manages the delay and re-execution of a task without blocking the main loop.
+func (j *Job) handleRetry(ctx context.Context, jobID string, taskName string, writes chan<- writeOp) {
+	// Safely read retry configuration
+	j.RLock()
+	task := j.Tasks[taskName]
+	if task == nil {
+		j.RUnlock()
+		return
+	}
+	delay := task.RetryDelay
+	attempt := task.Retries - task.remaining
+	j.RUnlock()
+
+	// Wait outside the lock so the main event loop can continue processing other tasks!
+	delay.wait(taskName, attempt)
+
+	// Re-acquire lock to update state and restart
+	j.Lock()
+	if t, ok := j.Tasks[taskName]; ok && t.state == upForRetry {
+		t.remaining--
+		t.state = running
+		log.Printf("jobID=%v, job=%v, task=%v, msg=retrying", jobID, j.Name, taskName)
+		go t.run(ctx, writes)
+	}
+	j.Unlock()
 }
 
 // evaluateDownstreamTasks checks pending downstream tasks and starts them
@@ -193,16 +227,12 @@ func (j *Job) evaluateDownstreamTasks(ctx context.Context, jobID string, writes 
 	defer j.Unlock()
 
 	for _, task := range j.Tasks {
+		// Only evaluate tasks that haven't started yet
 		if task.state != none {
 			continue
 		}
+		// Only evaluate tasks that actually have dependencies
 		if !j.Dag.isDownstream(task.Name) {
-			continue
-		}
-
-		if task.state == upForRetry {
-			task.state = running
-			go task.run(ctx, writes)
 			continue
 		}
 
@@ -246,40 +276,17 @@ func (j *Job) allDone() bool {
 	return true
 }
 
-func (j *Job) allSuccessful() bool {
-	j.RLock()
-	defer j.RUnlock()
-	for _, t := range j.Tasks {
-		if t.state != successful {
-			return false
-		}
-	}
-	return true
-}
-
-func (j *Job) anyFailed() bool {
-	j.RLock()
-	defer j.RUnlock()
-	for _, t := range j.Tasks {
-		if t.state == failed {
-			return true
-		}
-	}
-	return false
-}
-
 // syncStateToStore persists the execution and task state to the gokv store.
 func syncStateToStore(store gokv.Store, e *execution, taskName string, taskState state) {
 	if store == nil {
 		return
 	}
 
-	// Save overall execution state
 	execKey := fmt.Sprintf("execution:%s", e.ID)
-	execBytes, _ := json.Marshal(e)
-	_ = store.Set(execKey, execBytes)
+	if execBytes, err := json.Marshal(e); err == nil {
+		_ = store.Set(execKey, execBytes)
+	}
 
-	// Save individual task state
 	taskKey := fmt.Sprintf("execution:%s:task:%s", e.ID, taskName)
 	_ = store.Set(taskKey, string(taskState))
 }
