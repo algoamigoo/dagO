@@ -39,19 +39,11 @@ func (g *Goflow) addAPIRoutes() *Goflow {
 	api := g.router.Group("/api")
 	{
 		api.GET("/health", func(c *gin.Context) {
-			var msg struct {
-				Health string `json:"health"`
-			}
-			msg.Health = "OK"
-			c.JSON(http.StatusOK, msg)
+			c.JSON(http.StatusOK, gin.H{"health": "OK"})
 		})
 
 		api.GET("/jobs", func(c *gin.Context) {
-			var msg struct {
-				Jobs []string `json:"jobs"`
-			}
-			msg.Jobs = g.jobs
-			c.JSON(http.StatusOK, msg)
+			c.JSON(http.StatusOK, gin.H{"jobs": g.jobs})
 		})
 
 		// Deprecated: will be removed in v3.0.0
@@ -64,36 +56,34 @@ func (g *Goflow) addAPIRoutes() *Goflow {
 			for job := range g.Jobs {
 				stored, _ := readExecutions(g.Store, job)
 				for _, execution := range stored {
+					// FIXED: Clean filtering logic using continue
 					if stateQuery != "" && stateQuery != string(execution.State) {
-					} else if jobName != "" && jobName != execution.JobName {
-					} else {
-
-						t := taskstate{make(map[string]state, 0)}
-
-						for _, task := range execution.TaskExecutions {
-							t.Taskstate[task.Name] = task.State
-						}
-
-						j := jobrun{
-							JobName:   job,
-							Submitted: execution.StartedAt,
-							JobState: jobstate{
-								State:     execution.State,
-								TaskState: t,
-							},
-						}
-
-						jobruns = append(jobruns, j)
+						continue
 					}
+					if jobName != "" && jobName != execution.JobName {
+						continue
+					}
+
+					t := taskstate{Taskstate: make(map[string]state)}
+
+					for _, task := range execution.TaskExecutions {
+						t.Taskstate[task.Name] = task.State
+					}
+
+					j := jobrun{
+						JobName:   execution.JobName, // Use execution's job name for accuracy
+						Submitted: execution.StartedAt,
+						JobState: jobstate{
+							State:     execution.State,
+							TaskState: t,
+						},
+					}
+
+					jobruns = append(jobruns, j)
 				}
 			}
 
-			var msg struct {
-				Jobruns []jobrun `json:"jobruns"`
-			}
-			msg.Jobruns = jobruns
-
-			c.JSON(http.StatusOK, msg)
+			c.JSON(http.StatusOK, gin.H{"jobruns": jobruns})
 		})
 
 		api.GET("/executions", func(c *gin.Context) {
@@ -105,20 +95,18 @@ func (g *Goflow) addAPIRoutes() *Goflow {
 			for job := range g.Jobs {
 				stored, _ := readExecutions(g.Store, job)
 				for _, execution := range stored {
+					// FIXED: Clean filtering logic using continue
 					if stateQuery != "" && stateQuery != string(execution.State) {
-					} else if jobName != "" && jobName != execution.JobName {
-					} else {
-						executions = append(executions, execution)
+						continue
 					}
+					if jobName != "" && jobName != execution.JobName {
+						continue
+					}
+					executions = append(executions, execution)
 				}
 			}
 
-			var msg struct {
-				Executions []*execution `json:"executions"`
-			}
-			msg.Executions = executions
-
-			c.JSON(http.StatusOK, msg)
+			c.JSON(http.StatusOK, gin.H{"executions": executions})
 		})
 
 		api.GET("/jobs/:name", func(c *gin.Context) {
@@ -134,15 +122,17 @@ func (g *Goflow) addAPIRoutes() *Goflow {
 			}
 
 			if ok {
+				j := jobFn() // FIXED: Call factory exactly once to avoid redundant allocations
 				msg.JobName = name
-				msg.TaskNames = jobFn().tasks
-				msg.Dag = jobFn().Dag
-				msg.Schedule = g.Jobs[name]().Schedule
+				msg.TaskNames = j.tasks
+				msg.Dag = j.Dag
+				msg.Schedule = j.Schedule
 
 				// check if the job is active by looking in the list of cron entries
 				for _, entry := range g.cron.Entries() {
-					if jobName := entry.Job.(*scheduledExecution).jobFunc().Name; name == jobName {
+					if entryName := entry.Job.(*scheduledExecution).jobFunc().Name; entryName == name {
 						msg.Active = true
+						break // FIXED: Added break for optimization
 					}
 				}
 
@@ -157,16 +147,18 @@ func (g *Goflow) addAPIRoutes() *Goflow {
 			_, ok := g.Jobs[name]
 
 			var msg struct {
-				Job       string `json:"job"`
-				Success   bool   `json:"success"`
-				Submitted string `json:"submitted"`
+				Job         string `json:"job"`
+				Success     bool   `json:"success"`
+				Submitted   string `json:"submitted"`
+				ExecutionID string `json:"execution_id,omitempty"` // FIXED: Added to response for client tracking
 			}
 			msg.Job = name
 
 			if ok {
-				g.execute(name)
+				execID := g.execute(name) // FIXED: Capture the returned UUID
 				msg.Success = true
 				msg.Submitted = time.Now().UTC().Format(time.RFC3339Nano)
+				msg.ExecutionID = execID.String()
 				c.JSON(http.StatusOK, msg)
 			} else {
 				msg.Success = false
@@ -182,11 +174,18 @@ func (g *Goflow) addAPIRoutes() *Goflow {
 				Job     string `json:"job"`
 				Success bool   `json:"success"`
 				Active  bool   `json:"active"`
+				Error   string `json:"error,omitempty"` // FIXED: Added error field
 			}
 			msg.Job = name
 
 			if ok {
-				isActive, _ := g.toggle(name)
+				isActive, err := g.toggle(name) // FIXED: Handle the error properly
+				if err != nil {
+					msg.Success = false
+					msg.Error = err.Error()
+					c.JSON(http.StatusInternalServerError, msg)
+					return
+				}
 				msg.Success = true
 				msg.Active = isActive
 				c.JSON(http.StatusOK, msg)
@@ -228,10 +227,11 @@ func (g *Goflow) addUIRoutes() *Goflow {
 			jobFn, ok := g.Jobs[name]
 
 			if ok {
+				j := jobFn() // FIXED: Call factory exactly once
 				c.HTML(http.StatusOK, "job.html.tmpl", gin.H{
 					"jobName":   name,
-					"taskNames": jobFn().tasks,
-					"schedule":  g.Jobs[name]().Schedule,
+					"taskNames": j.tasks,
+					"schedule":  j.Schedule,
 				})
 			} else {
 				c.String(http.StatusNotFound, "Not found")

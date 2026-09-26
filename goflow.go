@@ -1,7 +1,8 @@
-// Package goflow implements a simple but powerful DAG scheduler and dashboard.
+// Package dago implements a simple but powerful DAG scheduler and dashboard.
 package dago
 
 import (
+	"context"
 	"log"
 
 	"github.com/gin-gonic/gin"
@@ -69,7 +70,6 @@ type scheduledExecution struct {
 }
 
 func (schedExec *scheduledExecution) Run() {
-
 	// create job
 	job := schedExec.jobFunc()
 
@@ -78,8 +78,8 @@ func (schedExec *scheduledExecution) Run() {
 	persistNewExecution(schedExec.store, e)
 	indexExecutions(schedExec.store, e)
 
-	// start running the job
-	job.run(schedExec.store, e)
+	// start running the job in a new goroutine with context
+	go job.run(context.Background(), schedExec.store, e)
 }
 
 // AddJob takes a job-emitting function and registers it
@@ -126,8 +126,14 @@ func (g *Goflow) toggle(jobName string) (bool, error) {
 
 	// else add a new entry
 	jobFunc := g.Jobs[jobName]
+	job := jobFunc() // FIXED: Call factory exactly once to get the schedule
 	e := &scheduledExecution{g.Store, jobFunc}
-	g.cron.AddJob(jobFunc().Schedule, e)
+
+	_, err := g.cron.AddJob(job.Schedule, e)
+	if err != nil {
+		return false, err // FIXED: Properly return the error instead of ignoring it
+	}
+
 	return true, nil
 }
 
@@ -142,8 +148,8 @@ func (g *Goflow) execute(job string) uuid.UUID {
 	persistNewExecution(g.Store, e)
 	indexExecutions(g.Store, e)
 
-	// start running the job
-	go j.run(g.Store, e)
+	// start running the job in a new goroutine with context
+	go j.run(context.Background(), g.Store, e)
 
 	return e.ID
 }
